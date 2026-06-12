@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 import html
 from html.parser import HTMLParser
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import posixpath
 import re
 import sys
@@ -70,6 +70,7 @@ BLOCK_TAGS = {
 HEADING_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
 SKIP_TAGS = {"head", "math", "nav", "script", "style", "svg"}
 TRIMMABLE_EDGE_CHARS = "\"'()[]{}<>"
+INLINE_CHAPTER_RE = re.compile(r"^(chapter|part|book)\s+([0-9]+|[ivxlcdm]+)\b", re.IGNORECASE)
 
 UNICODE_ASCII_REPLACEMENTS = str.maketrans(
     {
@@ -175,6 +176,42 @@ def first_child_text(root: ET.Element, wanted_name: str) -> str:
     return ""
 
 
+def attr_value(node: ET.Element, wanted_name: str) -> str:
+    for name, value in node.attrib.items():
+        if local_name(name) == wanted_name:
+            return value
+    return ""
+
+
+def has_token(value: str, token: str) -> bool:
+    return token in re.split(r"\s+", value.lower().strip())
+
+
+def has_toc_type(node: ET.Element) -> bool:
+    return (
+        has_token(attr_value(node, "type"), "toc")
+        or has_token(attr_value(node, "properties"), "toc")
+    )
+
+
+def is_content_document(path: str, media_type: str) -> bool:
+    lowered = path.lower()
+    lowered_type = media_type.lower()
+    return lowered_type in {"application/xhtml+xml", "text/html"} or lowered.endswith(
+        (".xhtml", ".html", ".htm")
+    )
+
+
+def is_nav_document(path: str, media_type: str, properties: str) -> bool:
+    return has_token(properties, "nav") or (
+        is_content_document(path, media_type) and PurePosixPath(path).name.lower() == "nav.xhtml"
+    )
+
+
+def is_ncx_document(path: str, media_type: str) -> bool:
+    return media_type.lower() == "application/x-dtbncx+xml" or path.lower().endswith(".ncx")
+
+
 def looks_like_chapter(line: str) -> str | None:
     trimmed = clean_text(line)
     if not trimmed or len(trimmed) > 64:
@@ -188,6 +225,84 @@ def looks_like_chapter(line: str) -> str | None:
         return trimmed
 
     return None
+
+
+def inline_chapter_split(text: str) -> tuple[str, str] | None:
+    trimmed = clean_text(text)
+    if not trimmed:
+        return None
+
+    match = INLINE_CHAPTER_RE.match(trimmed)
+    if not match:
+        return None
+
+    remainder = clean_text(trimmed[match.end():].lstrip(":.- "))
+    if len(trimmed) <= 72 and len(trimmed.split()) <= 12 and looks_like_title_suffix(remainder):
+        return trimmed, ""
+
+    title = clean_text(match.group(0).rstrip(":.- "))
+    if not title:
+        return None
+    return title, remainder
+
+
+def looks_like_title_suffix(text: str) -> bool:
+    if not text:
+        return True
+    if ":" in text:
+        return True
+
+    letters = [char for char in text if char.isalpha()]
+    if letters:
+        uppercase = sum(1 for char in letters if char.upper() == char)
+        if uppercase / len(letters) >= 0.55:
+            return True
+
+    title_words = {
+        "a",
+        "an",
+        "and",
+        "as",
+        "at",
+        "by",
+        "for",
+        "from",
+        "in",
+        "of",
+        "on",
+        "or",
+        "the",
+        "to",
+        "with",
+    }
+    words = re.findall(r"[A-Za-z0-9']+", text)
+    if not words:
+        return False
+    return all(word[0].isupper() or word.lower() in title_words or word.isdigit() for word in words)
+
+
+def inferred_chapter_events(events: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    inferred: list[tuple[str, str]] = []
+    last_chapter = ""
+    for kind, value in events:
+        if kind != "text":
+            inferred.append((kind, value))
+            if kind == "chapter":
+                last_chapter = value
+            continue
+
+        split = inline_chapter_split(value)
+        if split is None:
+            inferred.append((kind, value))
+            continue
+
+        chapter, remainder = split
+        if chapter != last_chapter:
+            inferred.append(("chapter", chapter))
+            last_chapter = chapter
+        if remainder:
+            inferred.append(("text", remainder))
+    return inferred
 
 
 def iter_clean_words(text: str):
@@ -378,7 +493,87 @@ def container_rootfile(epub: zipfile.ZipFile) -> str:
     raise ValueError("EPUB container.xml does not name an OPF package file")
 
 
-def parse_package(epub: zipfile.ZipFile, opf_path: str) -> tuple[str, str, list[str]]:
+def parse_nav_toc(epub: zipfile.ZipFile, nav_path: str) -> dict[str, str]:
+    try:
+        root = ET.fromstring(read_zip_text(epub, nav_path))
+    except ET.ParseError:
+        return {}
+
+    nav_nodes = [node for node in root.iter() if local_name(node.tag) == "nav"]
+    target_navs = [node for node in nav_nodes if has_toc_type(node)] or nav_nodes[:1]
+    titles: dict[str, str] = {}
+    for nav in target_navs:
+        for node in nav.iter():
+            if local_name(node.tag) != "a":
+                continue
+            href = attr_value(node, "href")
+            title = clean_text(" ".join(node.itertext()))
+            if href and title:
+                titles.setdefault(zip_join(nav_path, href), title)
+    return titles
+
+
+def first_descendant_text(node: ET.Element, wanted_name: str) -> str:
+    for child in node.iter():
+        if local_name(child.tag) == wanted_name:
+            return clean_text(" ".join(child.itertext()))
+    return ""
+
+
+def first_descendant_attr(node: ET.Element, wanted_name: str, attr_name: str) -> str:
+    for child in node.iter():
+        if local_name(child.tag) == wanted_name:
+            return attr_value(child, attr_name)
+    return ""
+
+
+def parse_ncx_toc(epub: zipfile.ZipFile, ncx_path: str) -> dict[str, str]:
+    try:
+        root = ET.fromstring(read_zip_text(epub, ncx_path))
+    except ET.ParseError:
+        return {}
+
+    titles: dict[str, str] = {}
+    for node in root.iter():
+        if local_name(node.tag) != "navPoint":
+            continue
+        title = first_descendant_text(node, "text")
+        src = first_descendant_attr(node, "content", "src")
+        if title and src:
+            titles.setdefault(zip_join(ncx_path, src), title)
+    return titles
+
+
+def parse_toc_titles(
+    epub: zipfile.ZipFile,
+    manifest: dict[str, tuple[str, str, str]],
+    spine_toc_id: str,
+) -> dict[str, str]:
+    titles: dict[str, str] = {}
+    nav_paths = [
+        path
+        for path, media_type, properties in manifest.values()
+        if is_nav_document(path, media_type, properties)
+    ]
+    for nav_path in nav_paths:
+        titles.update(parse_nav_toc(epub, nav_path))
+
+    ncx_paths = []
+    if spine_toc_id and spine_toc_id in manifest:
+        ncx_paths.append(manifest[spine_toc_id][0])
+    ncx_paths.extend(
+        path
+        for path, media_type, _ in manifest.values()
+        if is_ncx_document(path, media_type) and path not in ncx_paths
+    )
+    for ncx_path in ncx_paths:
+        for path, title in parse_ncx_toc(epub, ncx_path).items():
+            titles.setdefault(path, title)
+
+    return titles
+
+
+def parse_package(epub: zipfile.ZipFile, opf_path: str) -> tuple[str, str, list[str], dict[str, str]]:
     package_xml = read_zip_text(epub, opf_path)
     root = ET.fromstring(package_xml)
     title = first_child_text(root, "title")
@@ -390,8 +585,15 @@ def parse_package(epub: zipfile.ZipFile, opf_path: str) -> tuple[str, str, list[
             item_id = node.attrib.get("id")
             href = node.attrib.get("href")
             media_type = node.attrib.get("media-type", "")
+            properties = node.attrib.get("properties", "")
             if item_id and href:
-                manifest[item_id] = (zip_join(opf_path, href), media_type)
+                manifest[item_id] = (zip_join(opf_path, href), media_type, properties)
+
+    spine_toc_id = ""
+    for node in root.iter():
+        if local_name(node.tag) == "spine":
+            spine_toc_id = node.attrib.get("toc", "")
+            break
 
     spine_paths: list[str] = []
     for node in root.iter():
@@ -401,37 +603,32 @@ def parse_package(epub: zipfile.ZipFile, opf_path: str) -> tuple[str, str, list[
         if idref not in manifest:
             continue
 
-        path, media_type = manifest[idref]
-        lowered = path.lower()
-        if media_type in {"application/xhtml+xml", "text/html"} or lowered.endswith(
-            (".xhtml", ".html", ".htm")
-        ):
+        path, media_type, _ = manifest[idref]
+        if is_content_document(path, media_type):
             spine_paths.append(path)
 
     if not spine_paths:
         raise ValueError("EPUB spine does not contain readable XHTML/HTML documents")
 
-    return title, author, spine_paths
-
-
-def fallback_chapter_title(path: str, index: int) -> str:
-    stem = PurePosixPath(path).stem
-    cleaned = clean_text(stem.replace("_", " ").replace("-", " "))
-    return cleaned or f"Chapter {index}"
+    return title, author, spine_paths, parse_toc_titles(epub, manifest, spine_toc_id)
 
 
 def epub_events_and_metadata(path: Path) -> tuple[str, str, list[tuple[str, str]]]:
     events: list[tuple[str, str]] = []
     with zipfile.ZipFile(path) as epub:
         opf_path = container_rootfile(epub)
-        title, author, spine_paths = parse_package(epub, opf_path)
+        title, author, spine_paths, toc_titles = parse_package(epub, opf_path)
 
-        for index, spine_path in enumerate(spine_paths, start=1):
+        for spine_path in spine_paths:
             chapter_events = html_events(read_zip_text(epub, spine_path))
             if not any(kind == "text" for kind, _ in chapter_events):
                 continue
             if not any(kind == "chapter" for kind, _ in chapter_events):
-                chapter_events.insert(0, ("chapter", fallback_chapter_title(spine_path, index)))
+                toc_title = toc_titles.get(spine_path)
+                if toc_title:
+                    chapter_events.insert(0, ("chapter", toc_title))
+                else:
+                    chapter_events = inferred_chapter_events(chapter_events)
             events.extend(chapter_events)
 
     return title or path.stem, author, events
