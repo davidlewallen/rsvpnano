@@ -7,6 +7,7 @@
 #include <cstring>
 #include <esp32s3/rom/miniz.h>
 #include <esp_heap_caps.h>
+#include <utility>
 #include <vector>
 
 #include "text/LatinText.h"
@@ -51,6 +52,7 @@ struct ManifestItem {
   String id;
   String path;
   String mediaType;
+  String properties;
 };
 
 uint16_t readLe16(const uint8_t *data) {
@@ -1314,6 +1316,186 @@ bool isBlockTag(const String &name) {
          name == "hr" || name == "dd" || name == "dt";
 }
 
+bool hasToken(const String &value, const String &token) {
+  int position = 0;
+  while (position < static_cast<int>(value.length())) {
+    while (position < static_cast<int>(value.length()) && isWhitespace(value[position])) {
+      ++position;
+    }
+    const int start = position;
+    while (position < static_cast<int>(value.length()) && !isWhitespace(value[position])) {
+      ++position;
+    }
+    if (position > start) {
+      String candidate = value.substring(start, position);
+      candidate.toLowerCase();
+      if (candidate == token) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool isRomanNumeralToken(const String &value) {
+  if (value.isEmpty()) {
+    return false;
+  }
+  for (size_t i = 0; i < value.length(); ++i) {
+    const char c = std::tolower(static_cast<unsigned char>(value[i]));
+    if (!(c == 'i' || c == 'v' || c == 'x' || c == 'l' || c == 'c' || c == 'd' ||
+          c == 'm')) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool isDigitsToken(const String &value) {
+  if (value.isEmpty()) {
+    return false;
+  }
+  for (size_t i = 0; i < value.length(); ++i) {
+    if (std::isdigit(static_cast<unsigned char>(value[i])) == 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+size_t countWords(const String &value) {
+  size_t words = 0;
+  size_t index = 0;
+  while (index < value.length()) {
+    while (index < value.length() && isWhitespace(value[index])) {
+      ++index;
+    }
+    if (index >= value.length()) {
+      break;
+    }
+    ++words;
+    while (index < value.length() && !isWhitespace(value[index])) {
+      ++index;
+    }
+  }
+  return words;
+}
+
+bool isSmallTitleWord(const String &word) {
+  String lowered = word;
+  lowered.toLowerCase();
+  return lowered == "a" || lowered == "an" || lowered == "and" || lowered == "as" ||
+         lowered == "at" || lowered == "by" || lowered == "for" || lowered == "from" ||
+         lowered == "in" || lowered == "of" || lowered == "on" || lowered == "or" ||
+         lowered == "the" || lowered == "to" || lowered == "with";
+}
+
+bool looksLikeTitleSuffix(const String &value) {
+  String text = value;
+  text.trim();
+  if (text.isEmpty()) {
+    return true;
+  }
+  if (text.indexOf(':') >= 0) {
+    return true;
+  }
+
+  size_t letters = 0;
+  size_t uppercase = 0;
+  for (size_t i = 0; i < text.length(); ++i) {
+    const unsigned char c = static_cast<unsigned char>(text[i]);
+    if (std::isalpha(c) != 0) {
+      ++letters;
+      if (std::isupper(c) != 0) {
+        ++uppercase;
+      }
+    }
+  }
+  if (letters > 0 && uppercase * 100 >= letters * 55) {
+    return true;
+  }
+
+  size_t wordCount = 0;
+  size_t index = 0;
+  while (index < text.length()) {
+    while (index < text.length() && !std::isalnum(static_cast<unsigned char>(text[index]))) {
+      ++index;
+    }
+    const size_t start = index;
+    while (index < text.length() && std::isalnum(static_cast<unsigned char>(text[index]))) {
+      ++index;
+    }
+    if (index <= start) {
+      continue;
+    }
+
+    ++wordCount;
+    const String word = text.substring(start, index);
+    const unsigned char first = static_cast<unsigned char>(word[0]);
+    if (!(std::isupper(first) != 0 || isDigitsToken(word) || isSmallTitleWord(word))) {
+      return false;
+    }
+  }
+
+  return wordCount > 0;
+}
+
+void trimLeadingChapterRemainderPunctuation(String &value) {
+  value.trim();
+  while (!value.isEmpty() &&
+         (value[0] == ':' || value[0] == '.' || value[0] == '-' || isWhitespace(value[0]))) {
+    value.remove(0, 1);
+    value.trim();
+  }
+}
+
+bool splitInlineChapterLine(const String &line, String &chapterTitle, String &remainder) {
+  String normalized = normalizeDisplayText(line);
+  normalized.trim();
+  if (normalized.isEmpty()) {
+    return false;
+  }
+
+  String lowered = normalized;
+  lowered.toLowerCase();
+  size_t index = 0;
+  while (index < lowered.length() && isWhitespace(lowered[index])) {
+    ++index;
+  }
+  const size_t typeStart = index;
+  while (index < lowered.length() && std::isalpha(static_cast<unsigned char>(lowered[index])) != 0) {
+    ++index;
+  }
+  const String markerType = lowered.substring(typeStart, index);
+  if (!(markerType == "chapter" || markerType == "part" || markerType == "book")) {
+    return false;
+  }
+  while (index < lowered.length() && isWhitespace(lowered[index])) {
+    ++index;
+  }
+  const size_t numberStart = index;
+  while (index < lowered.length() && std::isalnum(static_cast<unsigned char>(lowered[index])) != 0) {
+    ++index;
+  }
+  const String numberToken = lowered.substring(numberStart, index);
+  if (!(isDigitsToken(numberToken) || isRomanNumeralToken(numberToken))) {
+    return false;
+  }
+
+  remainder = normalized.substring(index);
+  trimLeadingChapterRemainderPunctuation(remainder);
+  if (normalized.length() <= 72 && countWords(normalized) <= 12 &&
+      looksLikeTitleSuffix(remainder)) {
+    chapterTitle = normalized;
+    remainder = "";
+    return true;
+  }
+
+  chapterTitle = normalized.substring(0, index);
+  chapterTitle.trim();
+  return !chapterTitle.isEmpty();
+}
+
 bool writeChapterMarker(File &output, const String &title, String &lastChapterTitle) {
   String cleaned = normalizeDisplayText(title);
   cleaned.trim();
@@ -1476,15 +1658,20 @@ bool writeXhtmlAsRsvp(const String &html, File &output, size_t &wordCount, size_
 class XhtmlRsvpStreamWriter {
  public:
   XhtmlRsvpStreamWriter(File &output, size_t &wordCount, size_t maxWords,
-                        String &lastChapterTitle)
+                        String &lastChapterTitle, bool &chapterWritten,
+                        const String &fallbackChapterTitle)
       : output_(output),
         wordCount_(wordCount),
         maxWords_(maxWords),
-        lastChapterTitle_(lastChapterTitle) {
+        lastChapterTitle_(lastChapterTitle),
+        chapterWritten_(chapterWritten),
+        pendingChapterTitle_(fallbackChapterTitle) {
     line_.reserve(160);
     heading_.reserve(80);
     tag_.reserve(96);
     entity_.reserve(16);
+    pendingChapterTitle_ = normalizeDisplayText(pendingChapterTitle_);
+    pendingChapterTitle_.trim();
   }
 
   bool write(const uint8_t *data, size_t length) {
@@ -1521,12 +1708,46 @@ class XhtmlRsvpStreamWriter {
       return true;
     }
 
+    if (!prepareChapterForCurrentLine()) {
+      return false;
+    }
+    if (line_.isEmpty()) {
+      return true;
+    }
+
     const bool keepGoing = writeBodyLine(output_, line_, wordCount_, maxWords_);
     line_ = "";
     if (!keepGoing) {
       reachedWordLimit_ = true;
     }
     return keepGoing;
+  }
+
+  bool prepareChapterForCurrentLine() {
+    if (!pendingChapterTitle_.isEmpty() && !hasChapterMarker_) {
+      if (!writeChapterMarker(output_, pendingChapterTitle_, lastChapterTitle_)) {
+        return false;
+      }
+      chapterWritten_ = true;
+      hasChapterMarker_ = true;
+      pendingChapterTitle_ = "";
+    }
+
+    String inferredChapter;
+    String remainder;
+    if (!hasChapterMarker_ && splitInlineChapterLine(line_, inferredChapter, remainder)) {
+      if (!writeChapterMarker(output_, inferredChapter, lastChapterTitle_)) {
+        return false;
+      }
+      chapterWritten_ = true;
+      hasChapterMarker_ = true;
+      line_ = remainder;
+      line_.trim();
+      if (line_.isEmpty()) {
+        return true;
+      }
+    }
+    return true;
   }
 
   void appendToActiveText(char c) {
@@ -1545,6 +1766,12 @@ class XhtmlRsvpStreamWriter {
 
     appendToActiveText(c);
     if (!inHeading_ && line_.length() > kBufferedTextFlushThreshold) {
+      if (!prepareChapterForCurrentLine()) {
+        return false;
+      }
+      if (line_.isEmpty()) {
+        return true;
+      }
       return flushWordAlignedPrefix(output_, line_, wordCount_, maxWords_);
     }
 
@@ -1600,8 +1827,12 @@ class XhtmlRsvpStreamWriter {
       if (closing) {
         inHeading_ = false;
         const String cleanedHeading = plainTextFromXmlFragment(heading_);
-        if (!writeChapterMarker(output_, cleanedHeading, lastChapterTitle_)) {
-          return false;
+        if (!cleanedHeading.isEmpty()) {
+          if (!writeChapterMarker(output_, cleanedHeading, lastChapterTitle_)) {
+            return false;
+          }
+          chapterWritten_ = true;
+          hasChapterMarker_ = true;
         }
         heading_ = "";
       } else if (!selfClosing) {
@@ -1704,14 +1935,17 @@ class XhtmlRsvpStreamWriter {
   size_t &wordCount_;
   size_t maxWords_;
   String &lastChapterTitle_;
+  bool &chapterWritten_;
   String line_;
   String heading_;
   String tag_;
   String entity_;
   String commentTail_;
+  String pendingChapterTitle_;
   Mode mode_ = Mode::Text;
   bool inHeading_ = false;
   bool reachedWordLimit_ = false;
+  bool hasChapterMarker_ = false;
   int skipDepth_ = 0;
 };
 
@@ -1809,6 +2043,7 @@ std::vector<ManifestItem> parseManifestItems(const String &opfXml, const String 
     item.id = attributeValue(tag, "id");
     item.path = resolveZipPath(opfBaseDir, attributeValue(tag, "href"));
     item.mediaType = attributeValue(tag, "media-type");
+    item.properties = attributeValue(tag, "properties");
 
     if (!item.id.isEmpty() && !item.path.isEmpty()) {
       items.push_back(item);
@@ -1845,6 +2080,18 @@ std::vector<String> parseSpineIds(const String &opfXml) {
   }
 
   return ids;
+}
+
+String parseSpineTocId(const String &opfXml) {
+  int position = opfXml.indexOf("<spine");
+  if (position < 0) {
+    return "";
+  }
+  const int end = opfXml.indexOf('>', position);
+  if (end < 0) {
+    return "";
+  }
+  return attributeValue(opfXml.substring(position, end + 1), "toc");
 }
 
 const ManifestItem *findManifestItem(const std::vector<ManifestItem> &items, const String &id) {
@@ -1937,6 +2184,8 @@ class ZipArchive {
 
   ContentExtractStatus extractContentToRsvp(const String &name, File &output, size_t &wordCount,
                                             size_t maxWords, String &lastChapterTitle,
+                                            bool &chapterWritten,
+                                            const String &fallbackChapterTitle,
                                             const EpubConverter::Options &options,
                                             size_t itemIndex, size_t itemCount) {
     const ZipEntry *entry = find(name);
@@ -1944,8 +2193,9 @@ class ZipArchive {
       Serial.printf("[epub-zip] Content entry not found: %s\n", name.c_str());
       return ContentExtractStatus::Failed;
     }
-    return extractContentToRsvp(*entry, output, wordCount, maxWords, lastChapterTitle, options,
-                                itemIndex, itemCount);
+    return extractContentToRsvp(*entry, output, wordCount, maxWords, lastChapterTitle,
+                                chapterWritten, fallbackChapterTitle, options, itemIndex,
+                                itemCount);
   }
 
  private:
@@ -2300,6 +2550,8 @@ class ZipArchive {
 
   ContentExtractStatus extractContentToRsvp(const ZipEntry &entry, File &output, size_t &wordCount,
                                             size_t maxWords, String &lastChapterTitle,
+                                            bool &chapterWritten,
+                                            const String &fallbackChapterTitle,
                                             const EpubConverter::Options &options,
                                             size_t itemIndex, size_t itemCount) {
     Serial.printf("[epub-zip] Extract content: %s method=%u flags=0x%04x c=%lu u=%lu\n",
@@ -2347,7 +2599,8 @@ class ZipArchive {
       return ContentExtractStatus::Failed;
     }
 
-    XhtmlRsvpStreamWriter writer(output, wordCount, maxWords, lastChapterTitle);
+    XhtmlRsvpStreamWriter writer(output, wordCount, maxWords, lastChapterTitle, chapterWritten,
+                                 fallbackChapterTitle);
     uint32_t totalOutputBytes = 0;
     uint32_t lastProgressBytes = 0;
 
@@ -2512,6 +2765,289 @@ class ZipArchive {
   std::vector<ZipEntry> entries_;
 };
 
+bool isNavDocument(const ManifestItem &item) {
+  const String path = toLowerCopy(item.path);
+  return hasToken(item.properties, "nav") ||
+         (isContentDocument(item) && path.endsWith("nav.xhtml"));
+}
+
+bool isNcxDocument(const ManifestItem &item) {
+  const String mediaType = toLowerCopy(item.mediaType);
+  const String path = toLowerCopy(item.path);
+  return mediaType == "application/x-dtbncx+xml" || path.endsWith(".ncx");
+}
+
+void addChapterTitleIfMissing(std::vector<std::pair<String, String>> &titles,
+                              const String &path,
+                              const String &title) {
+  String cleaned = normalizeDisplayText(title);
+  cleaned.trim();
+  if (path.isEmpty() || cleaned.isEmpty()) {
+    return;
+  }
+  for (const auto &entry : titles) {
+    if (entry.first == path) {
+      return;
+    }
+  }
+  titles.push_back(std::make_pair(path, cleaned));
+}
+
+String resolveLinkPath(const String &basePath, const String &href) {
+  return resolveZipPath(directoryForPath(basePath), href);
+}
+
+std::vector<std::pair<String, String>> parseNavChapterTitles(ZipArchive &zip,
+                                                            const String &navPath) {
+  std::vector<std::pair<String, String>> titles;
+  String navXml;
+  if (!zip.extractToString(navPath, navXml, kMaxOpfBytes)) {
+    return titles;
+  }
+
+  const String loweredNavXml = toLowerCopy(navXml);
+  int selectedOpen = -1;
+  int selectedOpenEnd = -1;
+  int fallbackOpen = -1;
+  int fallbackOpenEnd = -1;
+  int scanner = 0;
+  while (scanner >= 0) {
+    const int open = loweredNavXml.indexOf("<nav", scanner);
+    if (open < 0) {
+      break;
+    }
+    const int openEnd = loweredNavXml.indexOf('>', open + 4);
+    if (openEnd < 0) {
+      break;
+    }
+    const String tag = loweredNavXml.substring(open, openEnd + 1);
+    if (fallbackOpen < 0) {
+      fallbackOpen = open;
+      fallbackOpenEnd = openEnd;
+    }
+    if (hasToken(attributeValue(tag, "epub:type"), "toc") ||
+        hasToken(attributeValue(tag, "type"), "toc") ||
+        hasToken(attributeValue(tag, "properties"), "toc")) {
+      selectedOpen = open;
+      selectedOpenEnd = openEnd;
+      break;
+    }
+    scanner = openEnd + 1;
+  }
+
+  if (selectedOpen < 0) {
+    selectedOpen = fallbackOpen;
+    selectedOpenEnd = fallbackOpenEnd;
+  }
+  if (selectedOpen < 0 || selectedOpenEnd < 0) {
+    return titles;
+  }
+
+  const int selectedClose = loweredNavXml.indexOf("</nav", selectedOpenEnd + 1);
+  if (selectedClose < 0) {
+    return titles;
+  }
+
+  const String navBody = navXml.substring(selectedOpenEnd + 1, selectedClose);
+  const String loweredNavBody = toLowerCopy(navBody);
+  int anchorScanner = 0;
+  while (anchorScanner >= 0) {
+    const int anchorOpen = loweredNavBody.indexOf("<a", anchorScanner);
+    if (anchorOpen < 0) {
+      break;
+    }
+    const int anchorOpenEnd = loweredNavBody.indexOf('>', anchorOpen + 2);
+    if (anchorOpenEnd < 0) {
+      break;
+    }
+    const String anchorTag = navBody.substring(anchorOpen, anchorOpenEnd + 1);
+    const String href = attributeValue(anchorTag, "href");
+    const int textClose = loweredNavBody.indexOf("</a>", anchorOpenEnd + 1);
+    if (textClose < 0) {
+      break;
+    }
+    if (!href.isEmpty()) {
+      const String title = plainTextFromXmlFragment(navBody.substring(anchorOpenEnd + 1, textClose));
+      addChapterTitleIfMissing(titles, resolveLinkPath(navPath, href), title);
+    }
+    anchorScanner = textClose + 4;
+  }
+
+  return titles;
+}
+
+String firstElementText(const String &xml, const String &elementName) {
+  const String lowered = toLowerCopy(xml);
+  const String openNeedle = String("<") + elementName;
+  const String closeNeedle = String("</") + elementName + ">";
+  const int open = lowered.indexOf(openNeedle);
+  if (open < 0) {
+    return "";
+  }
+  const int openEnd = lowered.indexOf('>', open + openNeedle.length());
+  if (openEnd < 0) {
+    return "";
+  }
+  const int close = lowered.indexOf(closeNeedle, openEnd + 1);
+  if (close < 0) {
+    return "";
+  }
+  return plainTextFromXmlFragment(xml.substring(openEnd + 1, close));
+}
+
+std::vector<std::pair<String, String>> parseNcxChapterTitles(ZipArchive &zip,
+                                                            const String &ncxPath) {
+  std::vector<std::pair<String, String>> titles;
+  String ncxXml;
+  if (!zip.extractToString(ncxPath, ncxXml, kMaxOpfBytes)) {
+    return titles;
+  }
+
+  const String loweredNcx = toLowerCopy(ncxXml);
+  int scanner = 0;
+  while (scanner >= 0) {
+    const int open = loweredNcx.indexOf("<navpoint", scanner);
+    if (open < 0) {
+      break;
+    }
+    const int close = loweredNcx.indexOf("</navpoint>", open + 9);
+    if (close < 0) {
+      break;
+    }
+    const String navPoint = ncxXml.substring(open, close);
+    const String loweredPoint = loweredNcx.substring(open, close);
+    const String title = firstElementText(navPoint, "text");
+    const int contentOpen = loweredPoint.indexOf("<content");
+    if (contentOpen >= 0) {
+      const int contentEnd = loweredPoint.indexOf('>', contentOpen + 8);
+      if (contentEnd > contentOpen) {
+        const String tag = navPoint.substring(contentOpen, contentEnd + 1);
+        const String src = attributeValue(tag, "src");
+        if (!src.isEmpty()) {
+          addChapterTitleIfMissing(titles, resolveLinkPath(ncxPath, src), title);
+        }
+      }
+    }
+    scanner = close + 11;
+  }
+
+  return titles;
+}
+
+std::vector<std::pair<String, String>> parseTocChapterTitles(ZipArchive &zip,
+                                                            const std::vector<ManifestItem> &manifest,
+                                                            const String &spineTocId) {
+  std::vector<std::pair<String, String>> titles;
+  for (const ManifestItem &item : manifest) {
+    if (!isNavDocument(item)) {
+      continue;
+    }
+    for (const auto &entry : parseNavChapterTitles(zip, item.path)) {
+      addChapterTitleIfMissing(titles, entry.first, entry.second);
+    }
+  }
+
+  std::vector<String> ncxPaths;
+  const ManifestItem *spineToc = findManifestItem(manifest, spineTocId);
+  if (spineToc != nullptr) {
+    ncxPaths.push_back(spineToc->path);
+  }
+  for (const ManifestItem &item : manifest) {
+    if (!isNcxDocument(item)) {
+      continue;
+    }
+    bool seen = false;
+    for (const String &path : ncxPaths) {
+      if (path == item.path) {
+        seen = true;
+        break;
+      }
+    }
+    if (!seen) {
+      ncxPaths.push_back(item.path);
+    }
+  }
+
+  for (const String &ncxPath : ncxPaths) {
+    for (const auto &entry : parseNcxChapterTitles(zip, ncxPath)) {
+      addChapterTitleIfMissing(titles, entry.first, entry.second);
+    }
+  }
+  return titles;
+}
+
+String chapterTitleForPath(const std::vector<std::pair<String, String>> &titles,
+                           const String &path) {
+  for (const auto &entry : titles) {
+    if (entry.first == path) {
+      return entry.second;
+    }
+  }
+  return "";
+}
+
+bool insertFallbackChapter(const String &path, const String &fallbackTitle) {
+  const String cleaned = normalizeDisplayText(fallbackTitle);
+  if (cleaned.isEmpty()) {
+    return true;
+  }
+
+  const String rewritePath = path + ".fallback";
+  SD_MMC.remove(rewritePath);
+  File input = SD_MMC.open(path);
+  File output = SD_MMC.open(rewritePath, FILE_WRITE);
+  if (!input || !output) {
+    if (input) {
+      input.close();
+    }
+    if (output) {
+      output.close();
+    }
+    SD_MMC.remove(rewritePath);
+    return false;
+  }
+
+  bool inserted = false;
+  String line;
+  while (input.available()) {
+    const char c = static_cast<char>(input.read());
+    if (c == '\r') {
+      continue;
+    }
+    if (c == '\n') {
+      String trimmed = line;
+      trimmed.trim();
+      if (!inserted && trimmed.isEmpty()) {
+        output.print("@chapter ");
+        output.println(cleaned);
+        inserted = true;
+      }
+      output.println(line);
+      line = "";
+      continue;
+    }
+    if (line.length() < 256) {
+      line += c;
+    }
+  }
+  if (!line.isEmpty()) {
+    output.println(line);
+  }
+  if (!inserted) {
+    output.print("@chapter ");
+    output.println(cleaned);
+  }
+
+  input.close();
+  output.close();
+  SD_MMC.remove(path);
+  if (!SD_MMC.rename(rewritePath, path)) {
+    SD_MMC.remove(rewritePath);
+    return false;
+  }
+  return true;
+}
+
 bool convertEpubToRsvp(const String &epubPath, const String &tempPath, const String &rsvpPath,
                        const EpubConverter::Options &options) {
   reportProgress(options, "Opening EPUB", "Reading archive", 0);
@@ -2555,6 +3091,9 @@ bool convertEpubToRsvp(const String &epubPath, const String &tempPath, const Str
   const String opfBaseDir = directoryForPath(opfPath);
   const std::vector<ManifestItem> manifest = parseManifestItems(opfXml, opfBaseDir);
   const std::vector<String> spineIds = parseSpineIds(opfXml);
+  const String spineTocId = parseSpineTocId(opfXml);
+  const std::vector<std::pair<String, String>> tocChapterTitles =
+      parseTocChapterTitles(zip, manifest, spineTocId);
   std::vector<String> readingOrder;
   readingOrder.reserve(spineIds.size());
   Serial.printf("[epub] Package parsed: manifest=%u spine=%u base=%s\n",
@@ -2618,6 +3157,7 @@ bool convertEpubToRsvp(const String &epubPath, const String &tempPath, const Str
 
   size_t wordCount = 0;
   String lastChapterTitle;
+  bool chapterWritten = false;
 
   for (size_t i = 0; i < readingOrder.size() && !reachedWordLimit(wordCount, options.maxWords);
        ++i) {
@@ -2629,7 +3169,9 @@ bool convertEpubToRsvp(const String &epubPath, const String &tempPath, const Str
 
     const ContentExtractStatus extractStatus =
         zip.extractContentToRsvp(readingOrder[i], output, wordCount, options.maxWords,
-                                 lastChapterTitle, options, i, readingOrder.size());
+                                 lastChapterTitle, chapterWritten,
+                                 chapterTitleForPath(tocChapterTitles, readingOrder[i]), options,
+                                 i, readingOrder.size());
     const int finishPercent = 25 + static_cast<int>(((i + 1) * 70UL) / readingOrder.size());
     const String finishDetail =
         String(i + 1) + "/" + String(readingOrder.size()) + " " + String(wordCount) + " words";
@@ -2653,6 +3195,12 @@ bool convertEpubToRsvp(const String &epubPath, const String &tempPath, const Str
 
   if (wordCount == 0) {
     Serial.printf("[epub] No readable words extracted from %s\n", epubPath.c_str());
+    SD_MMC.remove(tempPath);
+    return false;
+  }
+
+  if (!chapterWritten && !insertFallbackChapter(tempPath, title)) {
+    Serial.printf("[epub] Could not insert fallback chapter in %s\n", tempPath.c_str());
     SD_MMC.remove(tempPath);
     return false;
   }
