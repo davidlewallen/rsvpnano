@@ -8,14 +8,18 @@ enum EpubConverter {
         let package = try parsePackage(zip: zip, opfPath: opfPath)
 
         var events: [RsvpEvent] = []
-        for (index, spinePath) in package.spinePaths.enumerated() {
+        for spinePath in package.spinePaths {
             guard let chapterData = try zip.data(for: spinePath),
                   let markup = RsvpConverter.decodeText(chapterData) else {
                 continue
             }
             var chapterEvents = RsvpConverter.htmlEvents(markup)
             if !chapterEvents.containsChapter {
-                chapterEvents.insert(.chapter(fallbackChapterTitle(path: spinePath, index: index + 1)), at: 0)
+                if let tocChapter = package.chapterTitles[spinePath] {
+                    chapterEvents.insert(.chapter(tocChapter), at: 0)
+                } else {
+                    chapterEvents = RsvpConverter.inferredChapterEvents(from: chapterEvents)
+                }
             }
             if chapterEvents.containsText {
                 events.append(contentsOf: chapterEvents)
@@ -59,14 +63,12 @@ enum EpubConverter {
         if paths.isEmpty {
             throw RsvpConversionError.unsupportedEpub
         }
-        return EpubPackage(title: parser.title, author: parser.author, spinePaths: paths)
-    }
-
-    private static func fallbackChapterTitle(path: String, index: Int) -> String {
-        let name = URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
-            .replacingOccurrences(of: "[_-]+", with: " ", options: .regularExpression)
-        let cleaned = RsvpConverter.cleanedLine(name)
-        return cleaned.isEmpty ? "Chapter \(index)" : cleaned
+        return EpubPackage(
+            title: parser.title,
+            author: parser.author,
+            spinePaths: paths,
+            chapterTitles: try parseTocTitles(manifest: parser.manifest, spineTocId: parser.spineTocId, zip: zip)
+        )
     }
 
     static func zipJoin(base: String, href: String) -> String {
@@ -112,6 +114,13 @@ private struct EpubPackage {
     let title: String
     let author: String
     let spinePaths: [String]
+    let chapterTitles: [String: String]
+}
+
+private struct EpubManifestItem {
+    let path: String
+    let mediaType: String
+    let properties: String
 }
 
 private extension Array where Element == RsvpEvent {
@@ -154,12 +163,13 @@ private final class RootfileParser: NSObject, XMLParserDelegate {
 
 private final class PackageParser: NSObject, XMLParserDelegate {
     private let opfPath: String
-    private var manifest: [String: (path: String, mediaType: String)] = [:]
     private var activeElement = ""
     private var textBuffer = ""
 
     private(set) var title = ""
     private(set) var author = ""
+    private(set) var manifest: [String: EpubManifestItem] = [:]
+    private(set) var spineTocId = ""
     private(set) var spinePaths: [String] = []
     private(set) var manifestContentPaths: [String] = []
 
@@ -186,11 +196,16 @@ private final class PackageParser: NSObject, XMLParserDelegate {
            let id = attributeDict["id"],
            let href = attributeDict["href"] {
             let mediaType = attributeDict["media-type"] ?? ""
+            let properties = attributeDict["properties"] ?? ""
             let path = EpubConverter.zipJoin(base: opfPath, href: href)
-            manifest[id] = (path, mediaType)
+            manifest[id] = EpubManifestItem(path: path, mediaType: mediaType, properties: properties)
             if isContentDocument(path: path, mediaType: mediaType) {
                 manifestContentPaths.append(path)
             }
+        }
+
+        if name == "spine" {
+            spineTocId = attributeDict["toc"] ?? spineTocId
         }
 
         if name == "itemref",
@@ -229,6 +244,219 @@ private final class PackageParser: NSObject, XMLParserDelegate {
             loweredPath.hasSuffix(".xhtml") ||
             loweredPath.hasSuffix(".html") ||
             loweredPath.hasSuffix(".htm")
+    }
+}
+
+private func parseTocTitles(manifest: [String: EpubManifestItem], spineTocId: String, zip: ZipArchive) throws -> [String: String] {
+    var titles: [String: String] = [:]
+    let navPaths = manifest.values
+        .filter { isNavDocument(path: $0.path, mediaType: $0.mediaType, properties: $0.properties) }
+        .map(\.path)
+    for navPath in navPaths {
+        guard let data = try zip.data(for: navPath),
+              let xml = RsvpConverter.decodeText(data) else {
+            continue
+        }
+        let parser = NavTocParser(tocPath: navPath)
+        try parser.parse(xml)
+        titles.merge(parser.chapterTitles) { current, _ in current }
+    }
+
+    var ncxPaths: [String] = []
+    if let ncxPath = manifest[spineTocId]?.path {
+        ncxPaths.append(ncxPath)
+    }
+    for item in manifest.values {
+        if isNcxDocument(path: item.path, mediaType: item.mediaType), !ncxPaths.contains(item.path) {
+            ncxPaths.append(item.path)
+        }
+    }
+
+    for ncxPath in ncxPaths {
+        guard let data = try zip.data(for: ncxPath),
+              let xml = RsvpConverter.decodeText(data) else {
+            continue
+        }
+        let parser = NcxTocParser(tocPath: ncxPath)
+        try parser.parse(xml)
+        titles.merge(parser.chapterTitles) { current, _ in current }
+    }
+    return titles
+}
+
+private func isContentDocument(path: String, mediaType: String) -> Bool {
+    let loweredPath = path.lowercased()
+    let loweredType = mediaType.lowercased()
+    return loweredType == "application/xhtml+xml" ||
+        loweredType == "text/html" ||
+        loweredPath.hasSuffix(".xhtml") ||
+        loweredPath.hasSuffix(".html") ||
+        loweredPath.hasSuffix(".htm")
+}
+
+private func isNavDocument(path: String, mediaType: String, properties: String) -> Bool {
+    hasToken(properties, "nav") ||
+        (isContentDocument(path: path, mediaType: mediaType) &&
+            URL(fileURLWithPath: path).lastPathComponent.lowercased() == "nav.xhtml")
+}
+
+private func isNcxDocument(path: String, mediaType: String) -> Bool {
+    mediaType.lowercased() == "application/x-dtbncx+xml" || path.lowercased().hasSuffix(".ncx")
+}
+
+private func hasToken(_ value: String, _ token: String) -> Bool {
+    value.lowercased().split(whereSeparator: \.isWhitespace).contains(Substring(token))
+}
+
+private final class NavTocParser: NSObject, XMLParserDelegate {
+    private let tocPath: String
+    private var depth = 0
+    private var explicitDepth: Int?
+    private var fallbackDepth: Int?
+    private var inAnchor = false
+    private var anchorHref = ""
+    private var anchorText = ""
+    private var explicitTitles: [String: String] = [:]
+    private var fallbackTitles: [String: String] = [:]
+
+    private(set) var chapterTitles: [String: String] = [:]
+
+    init(tocPath: String) {
+        self.tocPath = tocPath
+    }
+
+    func parse(_ xml: String) throws {
+        let parser = XMLParser(data: Data(xml.utf8))
+        parser.delegate = self
+        if !parser.parse() {
+            throw parser.parserError ?? RsvpConversionError.unsupportedEpub
+        }
+        chapterTitles = explicitTitles.isEmpty ? fallbackTitles : explicitTitles
+    }
+
+    func parser(_ parser: XMLParser, didStartElement elementName: String, namespaceURI: String?, qualifiedName qName: String?, attributes attributeDict: [String: String] = [:]) {
+        depth += 1
+        let name = localName(elementName)
+        if name == "nav" {
+            if fallbackDepth == nil {
+                fallbackDepth = depth
+            }
+            if explicitDepth == nil && hasTocAttribute(attributeDict) {
+                explicitDepth = depth
+            }
+        }
+
+        if name == "a", isInsideSelectedNav, let href = attributeDict["href"] {
+            inAnchor = true
+            anchorHref = href
+            anchorText = ""
+        }
+    }
+
+    func parser(_ parser: XMLParser, foundCharacters string: String) {
+        if inAnchor {
+            anchorText += string
+        }
+    }
+
+    func parser(_ parser: XMLParser, didEndElement elementName: String, namespaceURI: String?, qualifiedName qName: String?) {
+        let name = localName(elementName)
+        if inAnchor && name == "a" {
+            let title = RsvpConverter.cleanedLine(anchorText)
+            if !title.isEmpty {
+                let path = EpubConverter.zipJoin(base: tocPath, href: anchorHref)
+                if isInsideExplicitNav {
+                    explicitTitles[path] = explicitTitles[path] ?? title
+                } else {
+                    fallbackTitles[path] = fallbackTitles[path] ?? title
+                }
+            }
+            inAnchor = false
+            anchorHref = ""
+            anchorText = ""
+        }
+
+        if name == "nav" {
+            if explicitDepth == depth {
+                explicitDepth = nil
+            }
+            if fallbackDepth == depth {
+                fallbackDepth = nil
+            }
+        }
+        depth -= 1
+    }
+
+    private var isInsideExplicitNav: Bool {
+        guard let explicitDepth else {
+            return false
+        }
+        return depth >= explicitDepth
+    }
+
+    private var isInsideSelectedNav: Bool {
+        isInsideExplicitNav || (explicitTitles.isEmpty && fallbackDepth != nil && depth >= (fallbackDepth ?? 0))
+    }
+
+    private func hasTocAttribute(_ attributes: [String: String]) -> Bool {
+        hasToken(attributes["epub:type"] ?? "", "toc") ||
+            hasToken(attributes["type"] ?? "", "toc") ||
+            hasToken(attributes["properties"] ?? "", "toc")
+    }
+}
+
+private final class NcxTocParser: NSObject, XMLParserDelegate {
+    private let tocPath: String
+    private var navPointStack: [NcxNavPoint] = []
+    private var collectingTitle = false
+
+    private(set) var chapterTitles: [String: String] = [:]
+
+    private struct NcxNavPoint {
+        var title = ""
+        var source = ""
+    }
+
+    init(tocPath: String) {
+        self.tocPath = tocPath
+    }
+
+    func parse(_ xml: String) throws {
+        let parser = XMLParser(data: Data(xml.utf8))
+        parser.delegate = self
+        if !parser.parse() {
+            throw parser.parserError ?? RsvpConversionError.unsupportedEpub
+        }
+    }
+
+    func parser(_ parser: XMLParser, didStartElement elementName: String, namespaceURI: String?, qualifiedName qName: String?, attributes attributeDict: [String: String] = [:]) {
+        let name = localName(elementName)
+        if name == "navpoint" {
+            navPointStack.append(NcxNavPoint())
+        } else if name == "text", !navPointStack.isEmpty {
+            collectingTitle = true
+        } else if name == "content", !navPointStack.isEmpty, let source = attributeDict["src"] {
+            navPointStack[navPointStack.count - 1].source = source
+        }
+    }
+
+    func parser(_ parser: XMLParser, foundCharacters string: String) {
+        if collectingTitle, !navPointStack.isEmpty {
+            navPointStack[navPointStack.count - 1].title += string
+        }
+    }
+
+    func parser(_ parser: XMLParser, didEndElement elementName: String, namespaceURI: String?, qualifiedName qName: String?) {
+        let name = localName(elementName)
+        if name == "text" {
+            collectingTitle = false
+        } else if name == "navpoint", let point = navPointStack.popLast() {
+            let title = RsvpConverter.cleanedLine(point.title)
+            if !title.isEmpty, !point.source.isEmpty {
+                let path = EpubConverter.zipJoin(base: tocPath, href: point.source)
+                chapterTitles[path] = chapterTitles[path] ?? title
+            }
+        }
     }
 }
 

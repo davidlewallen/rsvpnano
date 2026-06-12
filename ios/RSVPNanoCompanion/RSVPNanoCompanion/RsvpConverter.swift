@@ -297,6 +297,58 @@ enum RsvpConverter {
         return nil
     }
 
+    static func inlineChapterSplit(from line: String) -> (title: String, remainder: String)? {
+        let trimmed = cleanedLine(line)
+        guard !trimmed.isEmpty,
+              let range = trimmed.range(
+                of: #"(?i)^(chapter|part|book)\s+([0-9]+|[ivxlcdm]+)\b"#,
+                options: .regularExpression
+              ) else {
+            return nil
+        }
+
+        let remainder = cleanedLine(
+            String(trimmed[range.upperBound...])
+                .replacingOccurrences(of: #"^[:.\-\s]+"#, with: "", options: .regularExpression)
+        )
+        if trimmed.count <= 72,
+           trimmed.split(whereSeparator: { $0 == " " }).count <= 12,
+           looksLikeTitleSuffix(remainder) {
+            return (trimmed, "")
+        }
+
+        let title = cleanedLine(
+            String(trimmed[range])
+                .replacingOccurrences(of: #"[:.\-\s]+$"#, with: "", options: .regularExpression)
+        )
+        return title.isEmpty ? nil : (title, remainder)
+    }
+
+    static func inferredChapterEvents(from events: [RsvpEvent]) -> [RsvpEvent] {
+        var inferred: [RsvpEvent] = []
+        var lastChapter = ""
+        for event in events {
+            switch event {
+            case .chapter(let title):
+                inferred.append(event)
+                lastChapter = title
+            case .text(let line):
+                guard let split = inlineChapterSplit(from: line) else {
+                    inferred.append(event)
+                    continue
+                }
+                if split.title != lastChapter {
+                    inferred.append(.chapter(split.title))
+                    lastChapter = split.title
+                }
+                if !split.remainder.isEmpty {
+                    inferred.append(.text(split.remainder))
+                }
+            }
+        }
+        return inferred
+    }
+
     private static func firstMatch(in value: String, pattern: String) -> String? {
         guard let regex = try? NSRegularExpression(pattern: pattern),
               let match = regex.firstMatch(in: value, range: NSRange(value.startIndex..., in: value)),
@@ -305,6 +357,38 @@ enum RsvpConverter {
             return nil
         }
         return String(value[range])
+    }
+
+    private static func looksLikeTitleSuffix(_ text: String) -> Bool {
+        if text.isEmpty {
+            return true
+        }
+        if text.contains(":") {
+            return true
+        }
+
+        let letters = text.filter { $0.isLetter }
+        if !letters.isEmpty {
+            let uppercase = letters.filter { String($0).uppercased() == String($0) }.count
+            if Double(uppercase) / Double(letters.count) >= 0.55 {
+                return true
+            }
+        }
+
+        let titleWords: Set<String> = [
+            "a", "an", "and", "as", "at", "by", "for", "from", "in", "of", "on", "or",
+            "the", "to", "with",
+        ]
+        let words = text.components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty }
+        guard !words.isEmpty else {
+            return false
+        }
+        return words.allSatisfy { word in
+            word.allSatisfy { $0.isNumber } ||
+                titleWords.contains(word.lowercased()) ||
+                word.unicodeScalars.first.map { CharacterSet.uppercaseLetters.contains($0) } == true
+        }
     }
 
     private static func normalizedText(_ text: String) -> String {
