@@ -68,6 +68,7 @@ class FocusTimer {
   };
 
   bool initImu();
+  bool probeImuAddress(uint8_t address);
   bool readRegister(uint8_t reg, uint8_t &value);
   bool writeRegister(uint8_t reg, uint8_t value);
   bool readRegisters(uint8_t startReg, uint8_t *buffer, size_t len);
@@ -90,6 +91,7 @@ class FocusTimer {
       OrientationState orientation);
 
   bool imuAvailable_ = false;
+  uint8_t imuAddress_ = BoardConfig::IMU_I2C_ADDRESS;
   float accelScale_ = 4.0f / 32768.0f;
   OrientationState rawOrientation_ = OrientationState::Unknown;
   OrientationState stableOrientation_ = OrientationState::Unknown;

@@ -36,6 +36,13 @@ TwoWire &imuWire() { return BoardConfig::IMU_USES_WIRE1 ? Wire1 : Wire; }
 
 const char *imuWireName() { return BoardConfig::IMU_USES_WIRE1 ? "Wire1" : "Wire"; }
 
+#if defined(RSVP_BOARD_WAVESHARE_ESP32S3_TOUCH_AMOLED_216) || \
+    defined(RSVP_BOARD_WAVESHARE_ESP32S3_TOUCH_AMOLED_18)
+constexpr bool kReleaseBusBeforeImuRead = true;
+#else
+constexpr bool kReleaseBusBeforeImuRead = false;
+#endif
+
 }  // namespace
 
 bool FocusTimer::begin() { return initImu(); }
@@ -265,74 +272,116 @@ bool FocusTimer::initImu() {
     return true;
   }
 
-  TwoWire &wire = imuWire();
-  wire.beginTransmission(BoardConfig::IMU_I2C_ADDRESS);
-  if (wire.endTransmission(true) != 0) {
-    imuAvailable_ = false;
-    Serial.printf("[timer] QMI8658 not responding addr=0x%02X bus=%s\n",
-                  BoardConfig::IMU_I2C_ADDRESS, imuWireName());
-    return false;
-  }
+  const uint8_t candidateAddresses[] = {
+      BoardConfig::IMU_I2C_ADDRESS,
+      0x6B,
+      0x6A,
+  };
+  bool sawRespondingAddress = false;
 
-  if (!writeRegister(kImuResetReg, kImuResetValue)) {
-    imuAvailable_ = false;
-    Serial.println("[timer] QMI8658 reset command failed");
-    return false;
-  }
-
-  const uint32_t waitStartedMs = millis();
-  uint8_t resetResult = 0;
-  bool resetReady = false;
-  while (millis() - waitStartedMs < 500) {
-    if (readRegister(kImuResetResultReg, resetResult) &&
-        resetResult == kImuResetResultValue) {
-      resetReady = true;
-      break;
+  for (uint8_t i = 0; i < sizeof(candidateAddresses); ++i) {
+    const uint8_t candidateAddress = candidateAddresses[i];
+    bool alreadyTried = false;
+    for (uint8_t j = 0; j < i; ++j) {
+      if (candidateAddresses[j] == candidateAddress) {
+        alreadyTried = true;
+        break;
+      }
     }
-    delay(10);
+    if (alreadyTried) {
+      continue;
+    }
+
+    if (!probeImuAddress(candidateAddress)) {
+      continue;
+    }
+    sawRespondingAddress = true;
+    imuAddress_ = candidateAddress;
+
+    uint8_t whoAmI = 0;
+    if (!readRegister(kImuWhoAmIReg, whoAmI) || whoAmI != kImuWhoAmIValue) {
+      Serial.printf("[timer] QMI8658 WHOAMI mismatch addr=0x%02X got=0x%02X expected=0x%02X\n",
+                    candidateAddress, whoAmI, kImuWhoAmIValue);
+      continue;
+    }
+
+    if (!writeRegister(kImuResetReg, kImuResetValue)) {
+      Serial.printf("[timer] QMI8658 reset command failed addr=0x%02X\n", candidateAddress);
+      continue;
+    }
+
+    const uint32_t waitStartedMs = millis();
+    uint8_t resetResult = 0;
+    bool resetReady = false;
+    while (millis() - waitStartedMs < 500) {
+      if (readRegister(kImuResetResultReg, resetResult) &&
+          resetResult == kImuResetResultValue) {
+        resetReady = true;
+        break;
+      }
+      delay(10);
+    }
+
+    if (!resetReady) {
+      Serial.printf("[timer] QMI8658 reset timeout addr=0x%02X last=0x%02X\n",
+                    candidateAddress, resetResult);
+      continue;
+    }
+
+    whoAmI = 0;
+    if (!readRegister(kImuWhoAmIReg, whoAmI) || whoAmI != kImuWhoAmIValue) {
+      Serial.printf("[timer] QMI8658 WHOAMI mismatch after reset addr=0x%02X got=0x%02X "
+                    "expected=0x%02X\n",
+                    candidateAddress, whoAmI, kImuWhoAmIValue);
+      continue;
+    }
+
+    if (!updateRegister(kImuCtrl1Reg, 0x40, 0x40) ||
+        !writeRegister(kImuCtrl8Reg, 0x80) ||
+        !writeRegister(kImuCtrl2Reg, 0x16) ||
+        !updateRegister(kImuCtrl5Reg, 0x07, 0x07) ||
+        !updateRegister(kImuCtrl7Reg, 0x01, 0x01)) {
+      Serial.printf("[timer] QMI8658 configuration failed addr=0x%02X\n", candidateAddress);
+      continue;
+    }
+
+    accelScale_ = 4.0f / 32768.0f;
+    resetOrientationStability();
+    imuAvailable_ = true;
+    Serial.printf("[timer] QMI8658 initialized addr=0x%02X bus=%s\n", imuAddress_,
+                  imuWireName());
+    return true;
   }
 
-  if (!resetReady) {
-    imuAvailable_ = false;
-    Serial.println("[timer] QMI8658 reset timeout");
-    return false;
+  imuAvailable_ = false;
+  if (sawRespondingAddress) {
+    Serial.printf("[timer] QMI8658 init failed bus=%s configured=0x%02X\n", imuWireName(),
+                  BoardConfig::IMU_I2C_ADDRESS);
+  } else {
+    Serial.printf("[timer] QMI8658 not responding bus=%s configured=0x%02X fallback=0x6A\n",
+                  imuWireName(), BoardConfig::IMU_I2C_ADDRESS);
   }
+  return false;
+}
 
-  uint8_t whoAmI = 0;
-  if (!readRegister(kImuWhoAmIReg, whoAmI) || whoAmI != kImuWhoAmIValue) {
-    imuAvailable_ = false;
-    Serial.printf("[timer] QMI8658 WHOAMI mismatch got=0x%02X expected=0x%02X\n", whoAmI,
-                  kImuWhoAmIValue);
-    return false;
-  }
-
-  if (!updateRegister(kImuCtrl1Reg, 0x40, 0x40) ||
-      !writeRegister(kImuCtrl8Reg, 0x80) ||
-      !writeRegister(kImuCtrl2Reg, 0x16) ||
-      !updateRegister(kImuCtrl5Reg, 0x07, 0x07) ||
-      !updateRegister(kImuCtrl7Reg, 0x01, 0x01)) {
-    imuAvailable_ = false;
-    Serial.println("[timer] QMI8658 configuration failed");
-    return false;
-  }
-
-  accelScale_ = 4.0f / 32768.0f;
-  resetOrientationStability();
-  imuAvailable_ = true;
-  Serial.printf("[timer] QMI8658 initialized addr=0x%02X bus=%s\n",
-                BoardConfig::IMU_I2C_ADDRESS, imuWireName());
-  return true;
+bool FocusTimer::probeImuAddress(uint8_t address) {
+  TwoWire &wire = imuWire();
+  wire.beginTransmission(address);
+  return wire.endTransmission(true) == 0;
 }
 
 bool FocusTimer::readRegister(uint8_t reg, uint8_t &value) {
   TwoWire &wire = imuWire();
-  wire.beginTransmission(BoardConfig::IMU_I2C_ADDRESS);
+  wire.beginTransmission(imuAddress_);
   wire.write(reg);
-  if (wire.endTransmission(false) != 0) {
+  if (wire.endTransmission(kReleaseBusBeforeImuRead) != 0) {
     return false;
   }
+  if (kReleaseBusBeforeImuRead) {
+    delayMicroseconds(50);
+  }
 
-  if (wire.requestFrom(static_cast<int>(BoardConfig::IMU_I2C_ADDRESS), 1, 1) != 1) {
+  if (wire.requestFrom(static_cast<int>(imuAddress_), 1, 1) != 1) {
     return false;
   }
 
@@ -342,7 +391,7 @@ bool FocusTimer::readRegister(uint8_t reg, uint8_t &value) {
 
 bool FocusTimer::writeRegister(uint8_t reg, uint8_t value) {
   TwoWire &wire = imuWire();
-  wire.beginTransmission(BoardConfig::IMU_I2C_ADDRESS);
+  wire.beginTransmission(imuAddress_);
   wire.write(reg);
   wire.write(value);
   return wire.endTransmission(true) == 0;
@@ -354,13 +403,16 @@ bool FocusTimer::readRegisters(uint8_t startReg, uint8_t *buffer, size_t len) {
   }
 
   TwoWire &wire = imuWire();
-  wire.beginTransmission(BoardConfig::IMU_I2C_ADDRESS);
+  wire.beginTransmission(imuAddress_);
   wire.write(startReg);
-  if (wire.endTransmission(false) != 0) {
+  if (wire.endTransmission(kReleaseBusBeforeImuRead) != 0) {
     return false;
   }
+  if (kReleaseBusBeforeImuRead) {
+    delayMicroseconds(50);
+  }
 
-  if (wire.requestFrom(static_cast<int>(BoardConfig::IMU_I2C_ADDRESS), static_cast<int>(len), 1) !=
+  if (wire.requestFrom(static_cast<int>(imuAddress_), static_cast<int>(len), 1) !=
       static_cast<int>(len)) {
     return false;
   }
