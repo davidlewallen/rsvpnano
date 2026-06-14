@@ -303,6 +303,13 @@ constexpr const char *kPrefWifiSsid = "wifi_ssid";
 constexpr const char *kPrefWifiPass = "wifi_pass";
 constexpr const char *kPrefOtaAuto = "ota_auto";
 constexpr const char *kPrefOtaOwner = "ota_owner";
+constexpr const char *kPrefTimerDurationByGenre[FocusTimer::kGenreCount] = {
+    "tmr_dur_0",
+    "tmr_dur_1",
+    "tmr_dur_2",
+    "tmr_dur_3",
+    "tmr_dur_4",
+};
 constexpr size_t kReaderFontSizeCount = 3;
 constexpr size_t kPhantomBeforeCharTargets[] = {64, 96, 144};
 constexpr size_t kPhantomAfterCharTargets[] = {96, 144, 208};
@@ -838,6 +845,10 @@ void App::begin() {
   brightnessLevelIndex_ = preferences_.getUChar(kPrefBrightness, brightnessLevelIndex_);
   if (brightnessLevelIndex_ >= kBrightnessLevelCount) {
     brightnessLevelIndex_ = kBrightnessLevelCount - 1;
+  }
+  for (uint8_t i = 0; i < FocusTimer::kGenreCount; ++i) {
+    focusTimer_.setTouchDurationIndexForGenre(
+        static_cast<FocusTimer::Genre>(i), preferences_.getUChar(kPrefTimerDurationByGenre[i], 0));
   }
   phantomWordsEnabled_ = preferences_.getBool(kPrefPhantomWords, phantomWordsEnabled_);
   readerBatteryVisibleWhilePlaying_ =
@@ -1775,6 +1786,10 @@ void App::reloadRuntimePreferences(uint32_t nowMs, bool rerender) {
   brightnessLevelIndex_ = preferences_.getUChar(kPrefBrightness, brightnessLevelIndex_);
   if (brightnessLevelIndex_ >= kBrightnessLevelCount) {
     brightnessLevelIndex_ = kBrightnessLevelCount - 1;
+  }
+  for (uint8_t i = 0; i < FocusTimer::kGenreCount; ++i) {
+    focusTimer_.setTouchDurationIndexForGenre(
+        static_cast<FocusTimer::Genre>(i), preferences_.getUChar(kPrefTimerDurationByGenre[i], 0));
   }
   phantomWordsEnabled_ = preferences_.getBool(kPrefPhantomWords, phantomWordsEnabled_);
   readerBatteryVisibleWhilePlaying_ =
@@ -2864,8 +2879,6 @@ void App::applyFocusTimerTouch(const TouchEvent &event, uint32_t nowMs) {
   const int deltaY = static_cast<int>(pausedTouch_.lastY) - static_cast<int>(pausedTouch_.startY);
   const int absDeltaX = abs(deltaX);
   const int absDeltaY = abs(deltaY);
-  const bool tapLike = absDeltaX <= static_cast<int>(kTapSlopPx) &&
-                       absDeltaY <= static_cast<int>(kTapSlopPx);
 
   if (focusTimer_.isActiveTimerRunning() && !focusTimerCancelHoldTriggered_ &&
       event.phase != TouchPhase::End &&
@@ -2890,7 +2903,17 @@ void App::applyFocusTimerTouch(const TouchEvent &event, uint32_t nowMs) {
     return;
   }
 
-  (void)tapLike;
+  if (focusTimer_.state() == FocusTimer::State::WaitForTouchStart &&
+      absDeltaX >= static_cast<int>(kSwipeThresholdPx) &&
+      absDeltaX > absDeltaY + static_cast<int>(kAxisBiasPx)) {
+    focusTimer_.stepTouchDuration(deltaX > 0 ? 1 : -1);
+    const uint8_t genreIndex = static_cast<uint8_t>(focusTimer_.genre());
+    if (genreIndex < FocusTimer::kGenreCount) {
+      preferences_.putUChar(kPrefTimerDurationByGenre[genreIndex],
+                            focusTimer_.touchDurationIndex());
+    }
+    renderFocusTimerSession();
+  }
 }
 
 void App::openFocusTimer() {
@@ -2929,6 +2952,7 @@ void App::resetFocusTimer() {
   focusTimerCancelHoldTriggered_ = false;
   pausedTouch_.active = false;
   focusTimerGenreSelectedIndex_ = kFocusTimerGenreBackIndex;
+  applyReaderUiOrientation();
 }
 
 void App::rebuildFocusTimerGenreMenuItems() {
@@ -6469,14 +6493,20 @@ void App::renderFocusTimerSession() {
       renderFocusTimerGenres();
       return;
     case FocusTimer::State::WaitForTouchStart:
-      display_.renderFocusTimerScreen("BEGIN", "", "", "Place on short side");
+      display_.renderFocusTimerScreen("BEGIN", "",
+                                      formatFocusTimerDuration(
+                                          focusTimer_.selectedTouchDurationMs()),
+                                      "Swipe to Change\nPlace to Start");
       return;
     case FocusTimer::State::TouchRunning:
       display_.renderFocusTimerScreen("BEGIN", "", remainingLabel, "",
-                                      "", focusTimer_.progressPercent(millis()));
+                                      "Restart", focusTimer_.progressPercent(millis()));
       return;
     case FocusTimer::State::WaitAfterTouch:
-      display_.renderFocusTimerScreen("WORK", "", "", "Flip to continue");
+      display_.renderFocusTimerScreen("BEGIN", "",
+                                      formatFocusTimerDuration(
+                                          focusTimer_.selectedTouchDurationMs()),
+                                      "Flip to restart");
       return;
     case FocusTimer::State::WorkRunning:
       display_.renderFocusTimerScreen("WORK", "", remainingLabel, "",
@@ -6491,7 +6521,7 @@ void App::renderFocusTimerSession() {
                                       -1, true);
       return;
     case FocusTimer::State::WaitAfterBreak:
-      display_.renderFocusTimerScreen("WORK", "", "", "Flip to begin");
+      display_.renderFocusTimerScreen("BEGIN", "", "", "Flip to restart");
       return;
     case FocusTimer::State::Cancelled:
       display_.renderFocusTimerScreen("BEGIN", "", "", "Place to begin again");
@@ -6973,6 +7003,16 @@ void App::updateTimeEstimateBuild(uint32_t nowMs) {
 String App::timeEstimateModeLabel() const {
   return uiText(accurateTimeEstimateEnabled_ ? UiText::TimeEstimateAccurate
                                              : UiText::TimeEstimateFast);
+}
+
+String App::formatFocusTimerDuration(uint32_t durationMs) const {
+  const uint32_t totalSeconds = durationMs / 1000UL;
+  const uint32_t minutes = totalSeconds / 60UL;
+  const uint32_t seconds = totalSeconds % 60UL;
+  char buffer[8];
+  std::snprintf(buffer, sizeof(buffer), "%02lu:%02lu", static_cast<unsigned long>(minutes),
+                static_cast<unsigned long>(seconds));
+  return String(buffer);
 }
 
 String App::formatReadingTimeRemaining(uint32_t remainingMs) const {

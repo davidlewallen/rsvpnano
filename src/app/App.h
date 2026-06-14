@@ -428,6 +428,7 @@ class App {
   uint8_t effectiveAnchorPercent() const;
   DisplayManager::TypographyConfig effectiveTypographyConfig() const;
   uint32_t currentReaderContentToken() const;
+  String formatFocusTimerDuration(uint32_t durationMs) const;
   String formatFocusTimerRemaining(uint32_t nowMs) const;
   String focusTimerCountsLabel() const;
   void playFocusTimerCompletionCue();
